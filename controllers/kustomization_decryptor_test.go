@@ -33,6 +33,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/kustomize/api/provider"
+	"sigs.k8s.io/kustomize/api/resource"
 )
 
 func TestKustomizationReconciler_Decryptor(t *testing.T) {
@@ -222,4 +225,342 @@ func TestKustomizationReconciler_Decryptor(t *testing.T) {
 		g.Expect(events[0].Message).Should(ContainSubstring("Reconciliation finished"))
 		g.Expect(events[0].Message).ShouldNot(ContainSubstring("configured"))
 	})
+}
+
+func TestKustomizeDecryptor_ImportKeys(t *testing.T) {
+	g := NewWithT(t)
+
+	const provider = "sops"
+
+	pgpKey, err := os.ReadFile("testdata/sops/pgp.asc")
+	g.Expect(err).ToNot(HaveOccurred())
+	ageKey, err := os.ReadFile("testdata/sops/age.txt")
+	g.Expect(err).ToNot(HaveOccurred())
+
+	tests := []struct {
+		name        string
+		decryption  *kustomizev1.Decryption
+		secret      *corev1.Secret
+		wantErr     bool
+		inspectFunc func(g *GomegaWithT, decryptor *KustomizeDecryptor)
+	}{
+		{
+			name: "PGP key",
+			decryption: &kustomizev1.Decryption{
+				Provider: provider,
+				SecretRef: &meta.LocalObjectReference{
+					Name: "pgp-secret",
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pgp-secret",
+					Namespace: provider,
+				},
+				Data: map[string][]byte{
+					"pgp" + DecryptionPGPExt: pgpKey,
+				},
+			},
+		},
+		{
+			name: "PGP key import error",
+			decryption: &kustomizev1.Decryption{
+				Provider: provider,
+				SecretRef: &meta.LocalObjectReference{
+					Name: "pgp-secret",
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pgp-secret",
+					Namespace: provider,
+				},
+				Data: map[string][]byte{
+					"pgp" + DecryptionPGPExt: []byte("not-a-valid-armored-key"),
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "age key",
+			decryption: &kustomizev1.Decryption{
+				Provider: provider,
+				SecretRef: &meta.LocalObjectReference{
+					Name: "age-secret",
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "age-secret",
+					Namespace: provider,
+				},
+				Data: map[string][]byte{
+					"age" + DecryptionAgeExt: ageKey,
+				},
+			},
+			inspectFunc: func(g *GomegaWithT, decryptor *KustomizeDecryptor) {
+				g.Expect(decryptor.ageIdentities).To(HaveLen(1))
+			},
+		},
+		{
+			name: "age key import error",
+			decryption: &kustomizev1.Decryption{
+				Provider: provider,
+				SecretRef: &meta.LocalObjectReference{
+					Name: "age-secret",
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "age-secret",
+					Namespace: provider,
+				},
+				Data: map[string][]byte{
+					"age" + DecryptionAgeExt: []byte("not-a-valid-key"),
+				},
+			},
+			wantErr: true,
+			inspectFunc: func(g *GomegaWithT, decryptor *KustomizeDecryptor) {
+				g.Expect(decryptor.ageIdentities).To(HaveLen(0))
+			},
+		},
+		{
+			name: "HC Vault token",
+			decryption: &kustomizev1.Decryption{
+				Provider: provider,
+				SecretRef: &meta.LocalObjectReference{
+					Name: "hcvault-secret",
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "hcvault-secret",
+					Namespace: provider,
+				},
+				Data: map[string][]byte{
+					DecryptionVaultTokenFileName: []byte("some-hcvault-token"),
+				},
+			},
+			inspectFunc: func(g *GomegaWithT, decryptor *KustomizeDecryptor) {
+				g.Expect(decryptor.vaultToken).To(Equal("some-hcvault-token"))
+			},
+		},
+		{
+			name: "Azure Key Vault token",
+			decryption: &kustomizev1.Decryption{
+				Provider: provider,
+				SecretRef: &meta.LocalObjectReference{
+					Name: "azkv-secret",
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "azkv-secret",
+					Namespace: provider,
+				},
+				Data: map[string][]byte{
+					DecryptionAzureAuthFile: []byte(`tenantId: some-tenant-id
+clientId: some-client-id
+clientSecret: some-client-secret`),
+				},
+			},
+			inspectFunc: func(g *GomegaWithT, decryptor *KustomizeDecryptor) {
+				g.Expect(decryptor.azureToken).ToNot(BeNil())
+			},
+		},
+		{
+			name: "Azure Key Vault token load config error",
+			decryption: &kustomizev1.Decryption{
+				Provider: provider,
+				SecretRef: &meta.LocalObjectReference{
+					Name: "azkv-secret",
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "azkv-secret",
+					Namespace: provider,
+				},
+				Data: map[string][]byte{
+					DecryptionAzureAuthFile: []byte(`{"malformed\: JSON"}`),
+				},
+			},
+			wantErr: true,
+			inspectFunc: func(g *GomegaWithT, decryptor *KustomizeDecryptor) {
+				g.Expect(decryptor.azureToken).To(BeNil())
+			},
+		},
+		{
+			name: "Azure Key Vault unsupported config",
+			decryption: &kustomizev1.Decryption{
+				Provider: provider,
+				SecretRef: &meta.LocalObjectReference{
+					Name: "azkv-secret",
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "azkv-secret",
+					Namespace: provider,
+				},
+				Data: map[string][]byte{
+					DecryptionAzureAuthFile: []byte(`tenantId: incomplete`),
+				},
+			},
+			wantErr: true,
+			inspectFunc: func(g *GomegaWithT, decryptor *KustomizeDecryptor) {
+				g.Expect(decryptor.azureToken).To(BeNil())
+			},
+		},
+		{
+			name: "multiple Secret data entries",
+			decryption: &kustomizev1.Decryption{
+				Provider: provider,
+				SecretRef: &meta.LocalObjectReference{
+					Name: "multiple-secret",
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "multiple-secret",
+					Namespace: provider,
+				},
+				Data: map[string][]byte{
+					"age" + DecryptionAgeExt:     ageKey,
+					DecryptionVaultTokenFileName: []byte("some-hcvault-token"),
+				},
+			},
+			inspectFunc: func(g *GomegaWithT, decryptor *KustomizeDecryptor) {
+				g.Expect(decryptor.vaultToken).ToNot(BeEmpty())
+				g.Expect(decryptor.ageIdentities).To(HaveLen(1))
+			},
+		},
+		{
+			name:       "no Decryption spec",
+			decryption: nil,
+			wantErr:    false,
+		},
+		{
+			name: "no Decryption Secret",
+			decryption: &kustomizev1.Decryption{
+				Provider: DecryptionProviderSOPS,
+			},
+			wantErr: false,
+		},
+		{
+			name: "non-existing Decryption Secret",
+			decryption: &kustomizev1.Decryption{
+				Provider: DecryptionProviderSOPS,
+				SecretRef: &meta.LocalObjectReference{
+					Name: "does-not-exist",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "unimplemented Decryption Provider",
+			decryption: &kustomizev1.Decryption{
+				Provider: "not-supported",
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			cb := fake.NewClientBuilder()
+			if tt.secret != nil {
+				cb.WithObjects(tt.secret)
+			}
+			kustomization := kustomizev1.Kustomization{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      provider + "-" + tt.name,
+					Namespace: provider,
+				},
+				Spec: kustomizev1.KustomizationSpec{
+					Interval:   metav1.Duration{Duration: 2 * time.Minute},
+					Path:       "./",
+					Decryption: tt.decryption,
+				},
+			}
+
+			kd, cleanup, err := NewTempDecryptor("", cb.Build(), kustomization)
+			g.Expect(err).ToNot(HaveOccurred())
+			t.Cleanup(cleanup)
+
+			match := Succeed()
+			if tt.wantErr {
+				match = HaveOccurred()
+			}
+			g.Expect(kd.ImportKeys(context.TODO())).To(match)
+
+			if tt.inspectFunc != nil {
+				tt.inspectFunc(g, kd)
+			}
+		})
+	}
+}
+
+func TestKustomizeDecryptor_DecryptResource(t *testing.T) {
+	var (
+		resourceFactory = provider.NewDefaultDepProvider().GetResourceFactory()
+
+		emptyResource = resourceFactory.FromMap(map[string]interface{}{})
+	)
+
+	tests := []struct {
+		name                   string
+		decryption             *kustomizev1.Decryption
+		configureDecryptorFunc func(g *GomegaWithT, decryptor *KustomizeDecryptor)
+		resource               *resource.Resource
+		wantResource           *resource.Resource
+		inspectFunc            func(g *GomegaWithT, decryptor *KustomizeDecryptor)
+	}{
+		{
+			name:         "no Decryption spec",
+			decryption:   nil,
+			resource:     emptyResource.DeepCopy(),
+			wantResource: nil,
+		},
+		{
+			name: "unimplemented Decryption Provider",
+			decryption: &kustomizev1.Decryption{
+				Provider: "not-supported",
+			},
+			resource:     emptyResource.DeepCopy(),
+			wantResource: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			kustomization := kustomizev1.Kustomization{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "decrypt-" + tt.name,
+					Namespace: "decrypt",
+				},
+				Spec: kustomizev1.KustomizationSpec{
+					Interval:   metav1.Duration{Duration: 2 * time.Minute},
+					Path:       "./",
+					Decryption: tt.decryption,
+				},
+			}
+
+			kd, cleanup, err := NewTempDecryptor("", fake.NewClientBuilder().Build(), kustomization)
+			g.Expect(err).ToNot(HaveOccurred())
+			t.Cleanup(cleanup)
+
+			if tt.configureDecryptorFunc != nil {
+				tt.configureDecryptorFunc(g, kd)
+			}
+
+			g.Expect(kd.DecryptResource(tt.resource)).To(Equal(tt.wantResource))
+
+			if tt.inspectFunc != nil {
+				tt.inspectFunc(g, kd)
+			}
+		})
+	}
 }
